@@ -1,5 +1,5 @@
 
-use std::net::{Ipv4Addr,IpAddr};
+use std::net::{Ipv4Addr,IpAddr,Ipv6Addr};
 use std::fmt;
 
 #[macro_use]
@@ -23,6 +23,7 @@ impl <T: Copy> Node<T>
         Node::<T> { left: None, right: None, val: None }
     }
 
+    // IPv4
     fn insert(&mut self, key: u32, mask: u32, val: T)
     {
         let bit: u32 = 0x80000000;
@@ -43,6 +44,26 @@ impl <T: Copy> Node<T>
         }
     }
 
+    // Ipv6
+    fn insert6(&mut self, key: u128, mask: u128, val: T)
+    {
+        let bit: u128 = 0x80000000000000000000000000000000;
+        if mask == 0 {
+            self.val = Some(val);
+            return;
+        }
+
+        let next_node = if (key & bit) == 0 { &mut self.left } else { &mut self.right };
+        match next_node {
+            &mut Some(ref mut boxed_node) => boxed_node.insert6(key << 1, mask << 1, val),
+            &mut None => {
+                let mut new_node = Node::<T> { val: None, left: None, right: None };
+                new_node.insert6(key << 1, mask << 1, val);
+                *next_node = Some(Box::new(new_node));
+            }
+        }
+    }
+
     fn _find(&self, key: u32, mask: u32, cur_val: Option<T>) -> Option<T>
     {
         let bit: u32 = 0x80000000;
@@ -57,9 +78,30 @@ impl <T: Copy> Node<T>
         }
     }
 
+    // IPv6
+    fn _find6(&self, key: u128, mask: u128, cur_val: Option<T>) -> Option<T>
+    {
+        let bit: u128 = 0x80000000000000000000000000000000;
+        if mask == 0 {
+            return self.val.or(cur_val);
+        }
+
+        let next_node = if (key & bit) == 0 { &self.left } else { &self.right };
+        match next_node {
+            &Some(ref boxed_node) => boxed_node._find6(key << 1, mask << 1, self.val.or(cur_val)),
+            &None                 => self.val.or(cur_val),
+        }
+    }
+
     fn find(&self, key: u32, mask: u32) -> Option<T>
     {
         self._find(key, mask, None)
+    }
+
+    // IPv6
+    fn find6(&self, key: u128, mask: u128) -> Option<T>
+    {
+        self._find6(key, mask, None)
     }
 
 }
@@ -95,7 +137,12 @@ impl PrefixTree {
                 self.root.insert(u32::from(net), mask, 1);
                 Ok(())
             },
-            IpAddr::V6(_) => Err(format_err!("Unimplemented Ipv6")),
+            IpAddr::V6(net) => {
+                let mask = (0xffffffffffffffffffffffffffffffff as u128) & !(((1 as u128) << (128 - prefix.prefix)) - 1);
+                self.root.insert6(u128::from(net), mask, 2);
+                Ok(())
+                //Err(format_err!("Unimplemented Ipv6")),
+            }
         }
     }
 
@@ -108,6 +155,17 @@ impl PrefixTree {
     {
         let ip_addr: Ipv4Addr = addr.parse()?;
         Ok(self.contains_addr_v4(ip_addr))
+    }
+
+    pub fn contains_addr_v6(&self, addr: Ipv6Addr) -> bool
+    {
+        self.root.find6(u128::from(addr), 0xffffffffffffffffffffffffffffffff).is_some()
+    }
+
+    pub fn contains_addr_v6_str(&self, addr: &str) -> Result<bool, Error>
+    {
+        let ip_addr: Ipv6Addr = addr.parse()?;
+        Ok(self.contains_addr_v6(ip_addr))
     }
 }
 
@@ -157,6 +215,27 @@ mod tests {
 
         // Check that 128.0.0.0/8 is None
         assert_eq!(root.find(0x80000000, 0xff000000), None);
+    }
+
+    #[test]
+    fn test_node_insert_find_v6() {
+        let mut root = Node::<u32>::new();
+        // Add 2001:abcd::/32
+        let key =  0x2001_abcd_0000_0000_0000_0000_0000_0000;
+        let mask = 0xffff_ffff_0000_0000_0000_0000_0000_0000;
+        let val = 1;
+        root.insert6(key, mask, val);
+
+        // Verify 2001:abcd::/32 is 1
+        assert_eq!(root.find6(key, mask), Some(1));
+
+        // 2001:abcd:1234:5678::/64 is 1
+        assert_eq!(root.find6(0x2001_abcd_1234_5678_0000_0000_0000_0000,
+                              0xffff_ffff_ffff_ffff_0000_0000_0000_0000), Some(1));
+
+        // 2001:abcd:/16 (2001::/16) is not present
+        assert_eq!(root.find6(0x2001_abcd_0000_0000_0000_0000_0000_0000,
+                              0xffff_0000_0000_0000_0000_0000_0000_0000), None);
     }
 
     #[test]
@@ -222,5 +301,17 @@ mod tests {
         assert!(tree.add_cidr("10.1.45.0/24").is_ok());
         assert_eq!(tree.contains_addr_v4_str("10.1.45.88").unwrap(), true);
         assert_eq!(tree.contains_addr_v4_str("10.1.50.22").unwrap(), true);
+    }
+
+    #[test]
+    fn test_v6() {
+        let mut tree = PrefixTree::new();
+        assert!(tree.add_cidr("2001:abcd::/32").is_ok());
+
+        assert!(tree.add_cidr("2002::/16").is_ok());
+
+        assert_eq!(tree.contains_addr_v6_str("2001:abcd:dead:beef::1").unwrap(), true);
+        assert_eq!(tree.contains_addr_v6_str("2001:abcd:ffff:ffff:ffff:ffff:0000:1111").unwrap(), true);
+        assert_eq!(tree.contains_addr_v6_str("2001:0000:dead:beef::1").unwrap(), false);
     }
 }
